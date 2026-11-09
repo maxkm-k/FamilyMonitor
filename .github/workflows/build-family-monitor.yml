@@ -1,0 +1,504 @@
+# Put this file at: .github/workflows/build-family-monitor.yml
+# Then: GitHub repo -> Actions -> "Build Family Monitor APK" -> Run workflow
+# Download the APK from the run's "Artifacts" section.
+name: Build Family Monitor APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.2
+
+      - name: Generate Android project
+        run: |
+          mkdir -p app/src/main/java/com/family/monitor
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'FamilyMonitor'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.2.2' apply false }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=false
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.family.monitor'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.family.monitor'
+                  minSdk 26
+                  targetSdk 33
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              packagingOptions {
+                  resources {
+                      excludes += ['META-INF/LICENSE', 'META-INF/LICENSE.txt', 'META-INF/NOTICE', 'META-INF/NOTICE.txt', 'META-INF/DEPENDENCIES']
+                      pickFirsts += ['META-INF/mailcap', 'META-INF/mimetypes.default', 'META-INF/javamail.default.providers', 'META-INF/javamail.default.address.map', 'META-INF/javamail.providers', 'META-INF/javamail.charset.map']
+                  }
+              }
+          }
+          dependencies {
+              implementation 'com.sun.mail:android-mail:1.6.7'
+              implementation 'com.sun.mail:android-activation:1.6.7'
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <application
+                  android:label="Family Monitor"
+                  android:icon="@android:drawable/ic_menu_view"
+                  android:allowBackup="false">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".DnsVpnService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_VPN_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.net.VpnService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/family/monitor/Mailer.java <<'EOF'
+          package com.family.monitor;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import java.io.*;
+          import java.nio.charset.StandardCharsets;
+          import java.text.SimpleDateFormat;
+          import java.util.*;
+          import javax.mail.*;
+          import javax.mail.internet.*;
+
+          public class Mailer {
+              static final Object LOCK = new Object();
+
+              static File logFile(Context c) { return new File(c.getFilesDir(), "sites.log"); }
+
+              static void append(Context c, String domain) {
+                  String line = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date()) + "  " + domain + "\n";
+                  synchronized (LOCK) {
+                      try (FileOutputStream o = new FileOutputStream(logFile(c), true)) {
+                          o.write(line.getBytes(StandardCharsets.UTF_8));
+                      } catch (IOException ignored) { }
+                  }
+              }
+
+              static String read(Context c) {
+                  synchronized (LOCK) {
+                      File f = logFile(c);
+                      if (!f.exists()) return "";
+                      try (FileInputStream in = new FileInputStream(f)) {
+                          ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                          byte[] b = new byte[4096]; int n;
+                          while ((n = in.read(b)) > 0) bo.write(b, 0, n);
+                          return bo.toString("UTF-8");
+                      } catch (IOException e) { return ""; }
+                  }
+              }
+
+              /** Sends the pending list to the parent's Gmail. Returns true on success. */
+              static boolean send(Context c) {
+                  SharedPreferences p = c.getSharedPreferences("cfg", 0);
+                  final String user = p.getString("email", "");
+                  final String pass = p.getString("pass", "");
+                  String body = read(c);
+                  if (body.isEmpty()) body = "No new websites since the last report.";
+                  String time = new SimpleDateFormat("HH:mm", Locale.US).format(new Date());
+                  try {
+                      Properties props = new Properties();
+                      props.put("mail.smtp.auth", "true");
+                      props.put("mail.smtp.starttls.enable", "true");
+                      props.put("mail.smtp.host", "smtp.gmail.com");
+                      props.put("mail.smtp.port", "587");
+                      props.put("mail.smtp.connectiontimeout", "15000");
+                      props.put("mail.smtp.timeout", "15000");
+                      Session s = Session.getInstance(props, new Authenticator() {
+                          protected PasswordAuthentication getPasswordAuthentication() {
+                              return new PasswordAuthentication(user, pass);
+                          }
+                      });
+                      MimeMessage m = new MimeMessage(s);
+                      m.setFrom(new InternetAddress(user));
+                      m.setRecipients(Message.RecipientType.TO, InternetAddress.parse(user));
+                      m.setSubject("Family Monitor report " + time);
+                      m.setText("Websites contacted from this phone:\n\n" + body);
+                      Transport.send(m);
+                      synchronized (LOCK) { logFile(c).delete(); }
+                      p.edit().putString("status", "Last report sent at " + time + " to " + user).apply();
+                      return true;
+                  } catch (Exception e) {
+                      p.edit().putString("status", "Send failed at " + time + ": " + e.getMessage()).apply();
+                      return false;
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/family/monitor/DnsVpnService.java <<'EOF'
+          package com.family.monitor;
+
+          import android.app.*;
+          import android.content.Intent;
+          import android.net.VpnService;
+          import android.os.*;
+          import java.io.*;
+          import java.net.*;
+          import java.util.*;
+          import java.util.concurrent.*;
+
+          /** Local VPN that only captures DNS lookups (domain names). It does not read page content. */
+          public class DnsVpnService extends VpnService {
+              static volatile boolean running = false;
+              static final String VIRTUAL_DNS = "10.0.0.2";
+              static final String CHANNEL = "monitor";
+              static final long INTERVAL_MS = 30 * 60 * 1000L;
+
+              ParcelFileDescriptor tun;
+              Thread reader;
+              ExecutorService pool = Executors.newFixedThreadPool(6);
+              Handler handler = new Handler(Looper.getMainLooper());
+              final Map<String, Long> recent = new HashMap<>();
+
+              Runnable periodic = new Runnable() {
+                  public void run() {
+                      sendNow();
+                      handler.postDelayed(this, INTERVAL_MS);
+                  }
+              };
+
+              void sendNow() {
+                  new Thread(() -> {
+                      Mailer.send(DnsVpnService.this);
+                      showNotification(getSharedPreferences("cfg", 0).getString("status", ""));
+                  }).start();
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent != null && "STOP".equals(intent.getAction())) { stopAll(); return START_NOT_STICKY; }
+                  if (!getSharedPreferences("cfg", 0).getBoolean("enabled", false)) { stopSelf(); return START_NOT_STICKY; }
+                  if (running) return START_STICKY;
+                  startForeground(1, buildNotification("Monitoring ON. Visited sites are emailed to the parent every 30 minutes."));
+                  try {
+                      tun = new Builder().setSession("Family Monitor")
+                              .addAddress("10.0.0.1", 32)
+                              .addDnsServer(VIRTUAL_DNS)
+                              .addRoute(VIRTUAL_DNS, 32)
+                              .establish();
+                  } catch (Exception e) { stopAll(); return START_NOT_STICKY; }
+                  if (tun == null) { stopAll(); return START_NOT_STICKY; }
+                  running = true;
+                  reader = new Thread(this::loop);
+                  reader.start();
+                  handler.postDelayed(periodic, INTERVAL_MS);
+                  return START_STICKY;
+              }
+
+              void stopAll() {
+                  running = false;
+                  handler.removeCallbacks(periodic);
+                  try { if (tun != null) tun.close(); } catch (IOException ignored) { }
+                  tun = null;
+                  pool.shutdownNow();
+                  stopForeground(true);
+                  stopSelf();
+              }
+
+              @Override public void onDestroy() { running = false; handler.removeCallbacks(periodic); super.onDestroy(); }
+
+              Notification buildNotification(String text) {
+                  NotificationManager nm = getSystemService(NotificationManager.class);
+                  nm.createNotificationChannel(new NotificationChannel(CHANNEL, "Monitoring status", NotificationManager.IMPORTANCE_LOW));
+                  PendingIntent pi = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
+                  return new Notification.Builder(this, CHANNEL)
+                          .setSmallIcon(android.R.drawable.ic_menu_view)
+                          .setContentTitle("Family Monitor is active")
+                          .setContentText(text)
+                          .setStyle(new Notification.BigTextStyle().bigText(text))
+                          .setContentIntent(pi)
+                          .setOngoing(true)
+                          .build();
+              }
+
+              void showNotification(String text) {
+                  getSystemService(NotificationManager.class).notify(1, buildNotification(text));
+              }
+
+              void loop() {
+                  try {
+                      FileInputStream in = new FileInputStream(tun.getFileDescriptor());
+                      final FileOutputStream out = new FileOutputStream(tun.getFileDescriptor());
+                      byte[] buf = new byte[32767];
+                      while (running) {
+                          int n = in.read(buf);
+                          if (n <= 0) continue;
+                          final byte[] pkt = Arrays.copyOf(buf, n);
+                          pool.execute(() -> handle(pkt, out));
+                      }
+                  } catch (Exception ignored) { }
+              }
+
+              void handle(byte[] pkt, FileOutputStream out) {
+                  try {
+                      if ((pkt[0] >> 4) != 4) return;
+                      int ihl = (pkt[0] & 0xF) * 4;
+                      if ((pkt[9] & 0xFF) != 17) return;
+                      int dport = ((pkt[ihl + 2] & 0xFF) << 8) | (pkt[ihl + 3] & 0xFF);
+                      if (dport != 53) return;
+                      int off = ihl + 8;
+                      int plen = pkt.length - off;
+                      if (plen < 13) return;
+
+                      String name = parseName(pkt, off + 12);
+                      if (name != null && !name.isEmpty()) {
+                          long now = System.currentTimeMillis();
+                          boolean log;
+                          synchronized (recent) {
+                              Long last = recent.get(name);
+                              log = last == null || now - last > 60000;
+                              if (log) recent.put(name, now);
+                          }
+                          if (log) Mailer.append(this, name);
+                      }
+
+                      DatagramSocket s = new DatagramSocket();
+                      protect(s);
+                      s.setSoTimeout(4000);
+                      InetAddress dns = InetAddress.getByAddress(new byte[]{8, 8, 8, 8});
+                      s.send(new DatagramPacket(pkt, off, plen, dns, 53));
+                      byte[] rb = new byte[4096];
+                      DatagramPacket rp = new DatagramPacket(rb, rb.length);
+                      s.receive(rp);
+                      s.close();
+
+                      int rl = rp.getLength();
+                      int total = ihl + 8 + rl;
+                      byte[] o = new byte[total];
+                      System.arraycopy(pkt, 0, o, 0, ihl);
+                      System.arraycopy(pkt, 16, o, 12, 4);
+                      System.arraycopy(pkt, 12, o, 16, 4);
+                      o[2] = (byte) (total >> 8); o[3] = (byte) total;
+                      o[8] = 64; o[10] = 0; o[11] = 0;
+                      int c = csum(o, 0, ihl);
+                      o[10] = (byte) (c >> 8); o[11] = (byte) c;
+                      o[ihl] = pkt[ihl + 2]; o[ihl + 1] = pkt[ihl + 3];
+                      o[ihl + 2] = pkt[ihl]; o[ihl + 3] = pkt[ihl + 1];
+                      int ul = 8 + rl;
+                      o[ihl + 4] = (byte) (ul >> 8); o[ihl + 5] = (byte) ul;
+                      o[ihl + 6] = 0; o[ihl + 7] = 0;
+                      System.arraycopy(rb, 0, o, ihl + 8, rl);
+                      synchronized (out) { out.write(o); }
+                  } catch (Exception ignored) { }
+              }
+
+              static String parseName(byte[] b, int i) {
+                  StringBuilder sb = new StringBuilder();
+                  try {
+                      while (i < b.length) {
+                          int len = b[i++] & 0xFF;
+                          if (len == 0 || len > 63) break;
+                          if (sb.length() > 0) sb.append('.');
+                          sb.append(new String(b, i, len, "UTF-8"));
+                          i += len;
+                      }
+                  } catch (Exception e) { return null; }
+                  return sb.toString().toLowerCase(Locale.US);
+              }
+
+              static int csum(byte[] b, int off, int len) {
+                  int sum = 0;
+                  for (int i = 0; i < len; i += 2) {
+                      int w = (b[off + i] & 0xFF) << 8;
+                      if (i + 1 < len) w |= (b[off + i + 1] & 0xFF);
+                      sum += w;
+                  }
+                  while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
+                  return ~sum & 0xFFFF;
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/family/monitor/MainActivity.java <<'EOF'
+          package com.family.monitor;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.net.VpnService;
+          import android.os.*;
+          import android.text.InputType;
+          import android.view.View;
+          import android.widget.*;
+
+          public class MainActivity extends Activity {
+              SharedPreferences p;
+              LinearLayout root;
+              Handler h = new Handler(Looper.getMainLooper());
+              TextView statusView, logView;
+
+              Runnable refresh = new Runnable() {
+                  public void run() {
+                      if (statusView != null) {
+                          statusView.setText((DnsVpnService.running ? "● Monitoring is ON" : "○ Monitoring is OFF")
+                                  + "\nReports go to: " + p.getString("email", "")
+                                  + "\nSchedule: every 30 minutes"
+                                  + "\n" + p.getString("status", "No report sent yet"));
+                          String log = Mailer.read(MainActivity.this);
+                          String[] lines = log.isEmpty() ? new String[0] : log.split("\n");
+                          StringBuilder sb = new StringBuilder("Waiting to be sent (" + lines.length + " entries):\n");
+                          for (int i = Math.max(0, lines.length - 40); i < lines.length; i++) sb.append(lines[i]).append("\n");
+                          logView.setText(sb.toString());
+                      }
+                      h.postDelayed(this, 3000);
+                  }
+              };
+
+              @Override protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  p = getSharedPreferences("cfg", 0);
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
+                  render();
+              }
+
+              @Override protected void onResume() { super.onResume(); h.post(refresh); }
+              @Override protected void onPause() { super.onPause(); h.removeCallbacks(refresh); }
+
+              TextView tv(String t, int size) {
+                  TextView v = new TextView(this);
+                  v.setText(t); v.setTextSize(size); v.setPadding(0, 16, 0, 16);
+                  return v;
+              }
+
+              Button btn(String t, View.OnClickListener l) {
+                  Button b = new Button(this);
+                  b.setText(t); b.setOnClickListener(l);
+                  return b;
+              }
+
+              void render() {
+                  ScrollView sv = new ScrollView(this);
+                  root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(40, 40, 40, 40);
+                  sv.addView(root);
+                  setContentView(sv);
+                  if (!p.contains("email")) setup(); else dash();
+              }
+
+              void setup() {
+                  root.addView(tv("Family Monitor – parent setup", 22));
+                  root.addView(tv("This app is visible and shows a notification while running. It records the website names (domains) this phone looks up and emails the list to the Gmail address below every 30 minutes. It does not read page content, messages or passwords.", 15));
+                  final EditText email = new EditText(this);
+                  email.setHint("Parent's Gmail address");
+                  email.setInputType(InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS);
+                  final EditText pass = new EditText(this);
+                  pass.setHint("Gmail App Password (16 characters)");
+                  pass.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+                  root.addView(email);
+                  root.addView(pass);
+                  root.addView(tv("Create an App Password at myaccount.google.com/apppasswords (2-Step Verification must be on). Do not use your normal Gmail password.", 13));
+                  root.addView(btn("Save and start monitoring", v -> {
+                      String e = email.getText().toString().trim();
+                      String pw = pass.getText().toString().replace(" ", "");
+                      if (!e.contains("@") || pw.length() < 8) {
+                          Toast.makeText(this, "Enter a valid Gmail and app password", Toast.LENGTH_LONG).show();
+                          return;
+                      }
+                      p.edit().putString("email", e).putString("pass", pw).apply();
+                      startMonitor();
+                      render();
+                  }));
+              }
+
+              void dash() {
+                  root.addView(tv("Family Monitor", 22));
+                  statusView = tv("", 16);
+                  logView = tv("", 12);
+                  root.addView(statusView);
+                  root.addView(btn("Stop monitoring (stop sending data)", v -> { stopMonitor(); }));
+                  root.addView(btn("Start monitoring", v -> startMonitor()));
+                  root.addView(btn("Send report now", v -> new Thread(() -> {
+                      Mailer.send(this);
+                  }).start()));
+                  root.addView(btn("Change Gmail settings", v -> {
+                      stopMonitor();
+                      p.edit().remove("email").remove("pass").apply();
+                      render();
+                  }));
+                  root.addView(logView);
+              }
+
+              void startMonitor() {
+                  p.edit().putBoolean("enabled", true).apply();
+                  Intent i = VpnService.prepare(this);
+                  if (i != null) startActivityForResult(i, 7);
+                  else onActivityResult(7, RESULT_OK, null);
+              }
+
+              @Override protected void onActivityResult(int req, int res, Intent d) {
+                  if (req == 7 && res == RESULT_OK) startForegroundService(new Intent(this, DnsVpnService.class));
+                  else if (req == 7) Toast.makeText(this, "VPN permission is required for monitoring", Toast.LENGTH_LONG).show();
+              }
+
+              void stopMonitor() {
+                  p.edit().putBoolean("enabled", false).apply();
+                  startService(new Intent(this, DnsVpnService.class).setAction("STOP"));
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FamilyMonitor-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
