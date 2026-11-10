@@ -65,7 +65,7 @@ jobs:
               }
               packagingOptions {
                   resources {
-                      excludes += ['META-INF/LICENSE', 'META-INF/LICENSE.txt', 'META-INF/NOTICE', 'META-INF/NOTICE.txt', 'META-INF/DEPENDENCIES']
+                      excludes += ['META-INF/LICENSE', 'META-INF/LICENSE.txt', 'META-INF/LICENSE.md', 'META-INF/NOTICE', 'META-INF/NOTICE.txt', 'META-INF/NOTICE.md', 'META-INF/DEPENDENCIES', 'META-INF/INDEX.LIST']
                       pickFirsts += ['META-INF/mailcap', 'META-INF/mimetypes.default', 'META-INF/javamail.default.providers', 'META-INF/javamail.default.address.map', 'META-INF/javamail.providers', 'META-INF/javamail.charset.map']
                   }
               }
